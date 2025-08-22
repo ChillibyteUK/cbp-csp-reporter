@@ -27,6 +27,7 @@ class CB_CSP_Reporter {
         if ( ! wp_next_scheduled( 'cb_csp_daily_rotate' ) ) {
             wp_schedule_event( time() + 3600, 'daily', 'cb_csp_daily_rotate' );
         }
+    	add_action( 'admin_menu', array( $this, 'add_admin_page' ) );
     }
 
     /**
@@ -43,6 +44,112 @@ class CB_CSP_Reporter {
                 'args'                => array(),
             )
         );
+
+        register_rest_route(
+            'csp/v1',
+            '/summary',
+            array(
+                'methods'             => 'GET',
+                'callback'            => array( $this, 'get_summary' ),
+                'permission_callback' => '__return_true',
+            )
+        );
+    }
+    /**
+     * Adds a simple admin page to show top offenders from the latest NDJSON file.
+     */
+    public function add_admin_page() {
+        add_menu_page(
+            'CSP Top Offenders',
+            'CSP Offenders',
+            'manage_options',
+            'cb-csp-offenders',
+            array( $this, 'render_admin_page' ),
+            'dashicons-shield',
+            80
+        );
+    }
+
+    /**
+     * Renders the admin page with top offenders.
+     */
+    public function render_admin_page() {
+        if ( ! current_user_can( 'manage_options' ) ) {
+            wp_die( 'Unauthorized.' );
+        }
+        $file   = $this->storage_path();
+        $counts = array();
+        global $wp_filesystem;
+        if ( ! $wp_filesystem ) {
+            require_once ABSPATH . 'wp-admin/includes/file.php';
+            WP_Filesystem();
+        }
+        if ( $wp_filesystem->exists( $file ) ) {
+            $contents = $wp_filesystem->get_contents( $file );
+            if ( false !== $contents ) {
+                $lines = explode( "\n", $contents );
+                foreach ( $lines as $line ) {
+                    if ( '' === trim( $line ) ) {
+                        continue;
+                    }
+                    $data = json_decode( $line, true );
+                    if ( ! empty( $data['blocked_uri'] ) ) {
+                        $key = $data['blocked_uri'];
+                        if ( ! isset( $counts[ $key ] ) ) {
+                            $counts[ $key ] = 0;
+                        }
+                        ++$counts[ $key ];
+                    }
+                }
+            }
+        }
+        arsort( $counts );
+        echo '<div class="wrap"><h1>CSP Top Offenders</h1>';
+        if ( empty( $counts ) ) {
+            echo '<p>No data found for today.</p>';
+        } else {
+            echo '<table class="widefat"><thead><tr><th>Blocked URI</th><th>Count</th></tr></thead><tbody>';
+            foreach ( array_slice( $counts, 0, 20 ) as $uri => $count ) {
+                echo '<tr><td>' . esc_html( $uri ) . '</td><td>' . esc_html( $count ) . '</td></tr>';
+            }
+            echo '</tbody></table>';
+        }
+        echo '</div>';
+    }
+
+    /**
+     * REST callback: Aggregates counts by effective_directive and blocked_uri from the latest NDJSON file.
+     */
+    public function get_summary() {
+        $file    = $this->storage_path();
+        $summary = array();
+        global $wp_filesystem;
+        if ( ! $wp_filesystem ) {
+            require_once ABSPATH . 'wp-admin/includes/file.php';
+            WP_Filesystem();
+        }
+        if ( $wp_filesystem->exists( $file ) ) {
+            $contents = $wp_filesystem->get_contents( $file );
+            if ( false !== $contents ) {
+                $lines = explode( "\n", $contents );
+                foreach ( $lines as $line ) {
+                    if ( '' === trim( $line ) ) {
+                        continue;
+                    }
+                    $data    = json_decode( $line, true );
+                    $dir     = isset( $data['effective_directive'] ) ? $data['effective_directive'] : 'unknown';
+                    $blocked = isset( $data['blocked_uri'] ) ? $data['blocked_uri'] : 'unknown';
+                    if ( ! isset( $summary[ $dir ] ) ) {
+                        $summary[ $dir ] = array();
+                    }
+                    if ( ! isset( $summary[ $dir ][ $blocked ] ) ) {
+                        $summary[ $dir ][ $blocked ] = 0;
+                    }
+                    ++$summary[ $dir ][ $blocked ];
+                }
+            }
+        }
+        return rest_ensure_response( $summary );
     }
 
     /**
@@ -211,17 +318,19 @@ class CB_CSP_Reporter {
 
         $written = 0;
         $path    = $this->storage_path();
-        $fh      = fopen( $path, 'ab' );
-        if ( false === $fh ) {
-            return new WP_REST_Response(
-				array(
-					'ok'     => false,
-					'reason' => 'cannot-open',
-				),
-				500
-			);
+        global $wp_filesystem;
+        if ( ! $wp_filesystem ) {
+            require_once ABSPATH . 'wp-admin/includes/file.php';
+            WP_Filesystem();
         }
-
+        $existing = '';
+        if ( $wp_filesystem->exists( $path ) ) {
+            $existing = $wp_filesystem->get_contents( $path );
+            if ( false === $existing ) {
+                $existing = '';
+            }
+        }
+        $new_lines = '';
         foreach ( $records as $r ) {
             $blocked = isset( $r['blocked_uri'] ) ? $r['blocked_uri'] : null;
             if ( $this->is_extension_noise( $blocked ) ) {
@@ -230,8 +339,7 @@ class CB_CSP_Reporter {
             if ( $this->is_ignorable_url( $blocked ) ) {
                 continue;
             }
-
-            $line = array(
+            $line       = array(
                 'received_at'         => $now,
                 'user_agent'          => $ua,
                 'document_uri'        => isset( $r['document_uri'] ) ? $r['document_uri'] : null,
@@ -247,13 +355,11 @@ class CB_CSP_Reporter {
                 'status_code'         => isset( $r['status_code'] ) ? (int) $r['status_code'] : null,
                 'ip'                  => isset( $_SERVER['REMOTE_ADDR'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REMOTE_ADDR'] ) ) : null,
             );
-
-            $json_line = wp_json_encode( $line ) . "\n";
-            fwrite( $fh, $json_line );
+            $json_line  = wp_json_encode( $line ) . "\n";
+            $new_lines .= $json_line;
             ++$written;
         }
-
-        fclose( $fh );
+        $wp_filesystem->put_contents( $path, $existing . $new_lines, FS_CHMOD_FILE );
 
         return new WP_REST_Response(
 			array(
