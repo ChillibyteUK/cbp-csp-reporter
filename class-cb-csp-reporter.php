@@ -38,7 +38,7 @@ class CB_CSP_Reporter {
             'csp/v1',
             '/report',
             array(
-                'methods'             => 'POST',
+                'methods'             => WP_REST_Server::CREATABLE,
                 'callback'            => array( $this, 'ingest' ),
                 'permission_callback' => '__return_true',
                 'args'                => array(),
